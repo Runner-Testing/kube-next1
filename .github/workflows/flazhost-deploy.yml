@@ -1,0 +1,81 @@
+name: Build & Deploy to FlazHost
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      # Guard: skip kalau HARBOR secrets belum ter-set ATAU tidak ada target
+      # (CapRover & Kube dua-duanya kosong). Workflow SUCCESS dengan warning.
+      - name: Check config
+        id: check
+        env:
+          HU: ${{ secrets.HARBOR_USERNAME }}
+          CAP: ${{ vars.CAPROVER_TARGETS }}
+          KUBE: ${{ vars.KUBE_TARGETS }}
+        run: |
+          # Build skip kalau Harbor belum set, ATAU target platform app kosong.
+          NO_CAP=false; NO_KUBE=false
+          if [ -z "$CAP" ] || [ "$CAP" = "[]" ]; then NO_CAP=true; fi
+          if [ -z "$KUBE" ] || [ "$KUBE" = "[]" ]; then NO_KUBE=true; fi
+          if [ -z "$HU" ] || { [ "$NO_CAP" = "true" ] && [ "$NO_KUBE" = "true" ]; }; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::FlazHost secrets/targets belum ter-set. Build & deploy di-skip. Setelah CD setup selesai / commit ulang, workflow jalan normal."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Set up Docker Buildx
+        if: steps.check.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to FlazHost Registry
+        if: steps.check.outputs.skip != 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: registry.flazhost.com
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+      - name: Build and push image
+        if: steps.check.outputs.skip != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          provenance: false
+          sbom: false
+          tags: |
+            registry.flazhost.com/${{ vars.HARBOR_PROJECT }}/${{ github.event.repository.name }}:${{ github.sha }}
+            registry.flazhost.com/${{ vars.HARBOR_PROJECT }}/${{ github.event.repository.name }}:latest
+
+  deploy-kube:
+    needs: build
+    if: ${{ needs.build.outputs.skip != 'true' && vars.KUBE_TARGETS != '' && vars.KUBE_TARGETS != '[]' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        namespace: ${{ fromJSON(vars.KUBE_TARGETS || '[]') }}
+    steps:
+      - name: Deploy ${{ matrix.namespace }} to Kubernetes
+        env:
+          WEBHOOK_URL: ${{ secrets.KUBE_WEBHOOK_URL }}
+          WEBHOOK_TOKEN: ${{ secrets.KUBE_WEBHOOK_TOKEN }}
+        run: |
+          if [ -z "$WEBHOOK_URL" ] || [ -z "$WEBHOOK_TOKEN" ]; then
+            echo "::warning::KUBE_WEBHOOK_URL/TOKEN belum ter-set, skip deploy Kube."
+            exit 0
+          fi
+          echo "Trigger rollout namespace=${{ matrix.namespace }} sha=${{ github.sha }}"
+          code=$(curl -sS -o /tmp/resp.json -w "%{http_code}" -X POST "$WEBHOOK_URL" \
+            -H "Authorization: Bearer $WEBHOOK_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"namespace\":\"${{ matrix.namespace }}\",\"image_tag\":\"${{ github.sha }}\"}")
+          echo "HTTP $code"; cat /tmp/resp.json || true
+          if [ "$code" -ge 300 ]; then echo "::error::Webhook gagal (HTTP $code)"; exit 1; fi
